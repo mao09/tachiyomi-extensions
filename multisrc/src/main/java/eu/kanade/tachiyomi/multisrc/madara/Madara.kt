@@ -787,7 +787,7 @@ abstract class Madara(
 
         countViews(document)
 
-        return chapterElements.map(::chapterFromElement)
+        return chapterElements.map(::chapterFromElement).sortedBy { it -> it.chapter_number }.reversed()
     }
 
     override fun chapterListSelector() = "li.wp-manga-chapter"
@@ -814,6 +814,7 @@ abstract class Madara(
                 ?: select("span a").firstOrNull()?.attr("title")?.let { parseRelativeDate(it) }
                 ?: parseChapterDate(select(chapterDateSelector()).firstOrNull()?.text())
         }
+        chapter.chapter_number = Regex("""\d+\.?\d*""").find(chapter.name)?.value?.toFloat() ?: -1f
 
         return chapter
     }
