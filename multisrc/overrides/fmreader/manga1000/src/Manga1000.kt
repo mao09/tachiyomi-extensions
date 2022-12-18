@@ -32,7 +32,7 @@ class Manga1000 : FMReader("Manga1000", "https://manga1000.top", "ja") {
             "weeks" -> chapterDate.add(Calendar.DATE, value * 7 * -1)
             "months" -> chapterDate.add(Calendar.MONTH, value * -1)
             "years" -> chapterDate.add(Calendar.YEAR, value * -1)
-            else ->  return 0
+            else -> return 0
         }
 
         return chapterDate.timeInMillis
