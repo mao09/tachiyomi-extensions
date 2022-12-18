@@ -11,6 +11,7 @@ import android.os.Looper
 import android.util.Log
 import android.view.View
 import android.webkit.JavascriptInterface
+import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -57,7 +58,7 @@ class Japscan : ConfigurableSource, ParsedHttpSource() {
 
     override val name = "Japscan"
 
-    override val baseUrl = "https://www.japscan.ws"
+    override val baseUrl = "https://www.japscan.me"
 
     override val lang = "fr"
 
@@ -180,7 +181,7 @@ class Japscan : ConfigurableSource, ParsedHttpSource() {
         element.select("a").first().let {
             manga.setUrlWithoutDomain(it.attr("href"))
             manga.title = it.text()
-            manga.thumbnail_url = "$baseUrl/imgs/${it.attr("href").replace(Regex("/$"),".jpg").replace("manga","mangas")}".toLowerCase(Locale.ROOT)
+            manga.thumbnail_url = "$baseUrl/imgs/${it.attr("href").replace(Regex("/$"),".jpg").replace("manga","mangas")}".lowercase(Locale.ROOT)
         }
         return manga
     }
@@ -350,13 +351,32 @@ class Japscan : ConfigurableSource, ParsedHttpSource() {
         Log.d("japscan", "ZJS at $zjsurl")
         val zjs = client.newCall(GET(baseUrl + zjsurl, headers)).execute().body!!.string()
         Log.d("japscan", "webtoon, netdumping initiated")
-        val pagecount = document.getElementsByTag("option").size
+
+        val pagesElement = document.getElementById("pages")
+        var pagecount = pagesElement.getElementsByTag("option").size
+
+        Log.d("japscan", "fallback $pagecount")
+
+        if (pagecount == 0) {
+            Log.d("japscan", "pagecount not found, fallback 1")
+            val element = document.select(".card:first-child .card-body p").toString()
+
+            val regex = """Pages<\/span>: ([0-9]+)<\/p>""".toRegex()
+            val matchResult = regex.find(element)
+
+            val (pagecountFromRegex) = matchResult!!.destructured
+
+            pagecount = pagecountFromRegex.toInt()
+
+            Log.d("japscan", "fallback pagecount with regex, result: $pagecount")
+        }
+
         val pages = ArrayList<Page>()
         val handler = Handler(Looper.getMainLooper())
         val checkNew = ArrayList<String>(pagecount)
-        var maxIter = document.getElementsByTag("option").size
+        var maxIter = pagecount
         var isSinglePage = false
-        if ((zjs.toLowerCase(Locale.ROOT).split("new image").size - 1) == 1) {
+        if ((zjs.lowercase(Locale.ROOT).split("new image").size - 1) == 1) {
             isSinglePage = true
             maxIter = 1
         }
@@ -375,6 +395,22 @@ class Japscan : ConfigurableSource, ParsedHttpSource() {
                     webview.settings.domStorageEnabled = true
                     webview.settings.userAgentString = webview.settings.userAgentString.replace("Mobile", "eliboM").replace("Android", "diordnA")
                     webview.webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView, url: String?) {
+                            if (pagecount === 0) {
+                                Log.d("japscan", "pagecount not found, fallback 2")
+                                Log.d("japscan", "dynamic page count detected, loading it through JS")
+                                super.onPageFinished(view, url)
+                                view.evaluateJavascript(
+                                    "(function() { return document.getElementById('pages').length; })();",
+                                    object : ValueCallback<String> {
+                                        override fun onReceiveValue(numberOfPages: String?) {
+                                            pagecount = numberOfPages!!.toInt()
+                                        }
+                                    }
+                                )
+                            }
+                        }
+
                         override fun shouldInterceptRequest(
                             view: WebView,
                             request: WebResourceRequest
@@ -395,7 +431,7 @@ class Japscan : ConfigurableSource, ParsedHttpSource() {
                 if (isSinglePage) {
                     webView?.loadUrl(baseUrl + document.select("li[^data-]").first().dataset()["chapter-url"])
                 } else {
-                    webView?.loadUrl(baseUrl + document.getElementsByTag("option")[i].attr("value"))
+                    webView?.loadUrl(baseUrl + pagesElement.getElementsByTag("option")[i].attr("value"))
                 }
             }
             barrier.await()

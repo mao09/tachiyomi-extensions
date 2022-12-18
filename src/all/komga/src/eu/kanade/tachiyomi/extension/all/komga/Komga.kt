@@ -2,10 +2,15 @@ package eu.kanade.tachiyomi.extension.all.komga
 
 import android.app.Application
 import android.content.SharedPreferences
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
 import android.util.Log
+import android.widget.Button
 import android.widget.Toast
-import eu.kanade.tachiyomi.extension.BuildConfig
+import androidx.preference.EditTextPreference
+import androidx.preference.PreferenceScreen
+import eu.kanade.tachiyomi.AppInfo
 import eu.kanade.tachiyomi.extension.all.komga.dto.AuthorDto
 import eu.kanade.tachiyomi.extension.all.komga.dto.BookDto
 import eu.kanade.tachiyomi.extension.all.komga.dto.CollectionDto
@@ -17,6 +22,7 @@ import eu.kanade.tachiyomi.extension.all.komga.dto.SeriesDto
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.source.ConfigurableSource
+import eu.kanade.tachiyomi.source.UnmeteredSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -44,9 +50,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-open class Komga(suffix: String = "") : ConfigurableSource, HttpSource() {
+open class Komga(suffix: String = "") : ConfigurableSource, UnmeteredSource, HttpSource() {
     override fun popularMangaRequest(page: Int): Request =
-        GET("$baseUrl/api/v1/series?page=${page - 1}&deleted=false", headers)
+        GET("$baseUrl/api/v1/series?page=${page - 1}&deleted=false&sort=metadata.titleSort,asc", headers)
 
     override fun popularMangaParse(response: Response): MangasPage =
         processSeriesPage(response)
@@ -103,7 +109,7 @@ open class Komga(suffix: String = "") : ConfigurableSource, HttpSource() {
                     val statusToInclude = mutableListOf<String>()
                     filter.state.forEach { content ->
                         if (content.state) {
-                            statusToInclude.add(content.name.toUpperCase(Locale.ROOT))
+                            statusToInclude.add(content.name.uppercase(Locale.ROOT))
                         }
                     }
                     if (statusToInclude.isNotEmpty()) {
@@ -156,7 +162,7 @@ open class Komga(suffix: String = "") : ConfigurableSource, HttpSource() {
                 }
                 is Filter.Sort -> {
                     var sortCriteria = when (filter.state?.index) {
-                        0 -> "metadata.titleSort"
+                        0 -> if (type == "series") "metadata.titleSort" else "name"
                         1 -> "createdDate"
                         2 -> "lastModifiedDate"
                         else -> ""
@@ -267,9 +273,12 @@ open class Komga(suffix: String = "") : ConfigurableSource, HttpSource() {
             title = metadata.title
             url = "$baseUrl/api/v1/series/$id"
             thumbnail_url = "$url/thumbnail"
-            status = when (metadata.status) {
-                "ONGOING" -> SManga.ONGOING
-                "ENDED" -> SManga.COMPLETED
+            status = when {
+                metadata.status == "ENDED" && metadata.totalBookCount != null && booksCount < metadata.totalBookCount -> SManga.PUBLISHING_FINISHED
+                metadata.status == "ENDED" -> SManga.COMPLETED
+                metadata.status == "ONGOING" -> SManga.ONGOING
+                metadata.status == "ABANDONED" -> SManga.CANCELLED
+                metadata.status == "HIATUS" -> SManga.ON_HIATUS
                 else -> SManga.UNKNOWN
             }
             genre = (metadata.genres + metadata.tags + booksMetadata.tags).distinct().joinToString(", ")
@@ -353,7 +362,7 @@ open class Komga(suffix: String = "") : ConfigurableSource, HttpSource() {
                 ReadFilter(),
                 TypeSelect(),
                 CollectionSelect(listOf(CollectionFilterEntry("None")) + collections.map { CollectionFilterEntry(it.name, it.id) }),
-                LibraryGroup(libraries.map { LibraryFilter(it.id, it.name) }.sortedBy { it.name.toLowerCase(Locale.ROOT) }),
+                LibraryGroup(libraries.map { LibraryFilter(it.id, it.name) }.sortedBy { it.name.lowercase(Locale.ROOT) }),
                 StatusGroup(listOf("Ongoing", "Ended", "Abandoned", "Hiatus").map { StatusFilter(it) }),
                 GenreGroup(genres.map { GenreFilter(it) }),
                 TagGroup(tags.map { TagFilter(it) }),
@@ -384,19 +393,19 @@ open class Komga(suffix: String = "") : ConfigurableSource, HttpSource() {
 
     // keep the previous ID when lang was "en", so that preferences and manga bindings are not lost
     override val id by lazy {
-        val key = "${name.toLowerCase()}/en/$versionId"
+        val key = "${name.lowercase()}/en/$versionId"
         val bytes = MessageDigest.getInstance("MD5").digest(key.toByteArray())
         (0..7).map { bytes[it].toLong() and 0xff shl 8 * (7 - it) }.reduce(Long::or) and Long.MAX_VALUE
     }
 
-    override val baseUrl by lazy { getPrefBaseUrl() }
-    private val username by lazy { getPrefUsername() }
-    private val password by lazy { getPrefPassword() }
+    override val baseUrl by lazy { preferences.baseUrl }
+    private val username by lazy { preferences.username }
+    private val password by lazy { preferences.password }
     private val json: Json by injectLazy()
 
     override fun headersBuilder(): Headers.Builder =
         Headers.Builder()
-            .add("User-Agent", "TachiyomiKomga/${BuildConfig.VERSION_NAME}")
+            .add("User-Agent", "TachiyomiKomga/${AppInfo.getVersionName()}")
 
     private val preferences: SharedPreferences by lazy {
         Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
@@ -416,23 +425,66 @@ open class Komga(suffix: String = "") : ConfigurableSource, HttpSource() {
             .dns(Dns.SYSTEM) // don't use DNS over HTTPS as it breaks IP addressing
             .build()
 
-    override fun setupPreferenceScreen(screen: androidx.preference.PreferenceScreen) {
-        screen.addPreference(screen.editTextPreference(ADDRESS_TITLE, ADDRESS_DEFAULT, baseUrl))
-        screen.addPreference(screen.editTextPreference(USERNAME_TITLE, USERNAME_DEFAULT, username))
-        screen.addPreference(screen.editTextPreference(PASSWORD_TITLE, PASSWORD_DEFAULT, password, true))
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        screen.addEditTextPreference(
+            title = ADDRESS_TITLE,
+            default = ADDRESS_DEFAULT,
+            value = baseUrl,
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI,
+            validate = { it.toHttpUrlOrNull() != null },
+            validationMessage = "The URL is invalid or malformed"
+        )
+        screen.addEditTextPreference(
+            title = USERNAME_TITLE,
+            default = USERNAME_DEFAULT,
+            value = username
+        )
+        screen.addEditTextPreference(
+            title = PASSWORD_TITLE,
+            default = PASSWORD_DEFAULT,
+            value = password,
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        )
     }
 
-    private fun androidx.preference.PreferenceScreen.editTextPreference(title: String, default: String, value: String, isPassword: Boolean = false): androidx.preference.EditTextPreference {
-        return androidx.preference.EditTextPreference(context).apply {
+    private fun PreferenceScreen.addEditTextPreference(
+        title: String,
+        default: String,
+        value: String,
+        inputType: Int? = null,
+        validate: ((String) -> Boolean)? = null,
+        validationMessage: String? = null
+    ) {
+        val preference = EditTextPreference(context).apply {
             key = title
             this.title = title
             summary = value
             this.setDefaultValue(default)
             dialogTitle = title
 
-            if (isPassword) {
-                setOnBindEditTextListener {
-                    it.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setOnBindEditTextListener { editText ->
+                if (inputType != null) {
+                    editText.inputType = inputType
+                }
+
+                if (validate != null) {
+                    editText.addTextChangedListener(object : TextWatcher {
+                        override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+
+                        override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+
+                        override fun afterTextChanged(editable: Editable?) {
+                            requireNotNull(editable)
+
+                            val text = editable.toString()
+
+                            val isValid = text.isBlank() || validate(text)
+
+                            editText.error = if (!isValid) validationMessage else null
+                            editText.rootView.findViewById<Button>(android.R.id.button1)
+                                ?.isEnabled = editText.error == null
+                        }
+                    })
                 }
             }
 
@@ -447,11 +499,18 @@ open class Komga(suffix: String = "") : ConfigurableSource, HttpSource() {
                 }
             }
         }
+
+        addPreference(preference)
     }
 
-    private fun getPrefBaseUrl(): String = preferences.getString(ADDRESS_TITLE, ADDRESS_DEFAULT)!!
-    private fun getPrefUsername(): String = preferences.getString(USERNAME_TITLE, USERNAME_DEFAULT)!!
-    private fun getPrefPassword(): String = preferences.getString(PASSWORD_TITLE, PASSWORD_DEFAULT)!!
+    private val SharedPreferences.baseUrl
+        get() = getString(ADDRESS_TITLE, ADDRESS_DEFAULT)!!.removeSuffix("/")
+
+    private val SharedPreferences.username
+        get() = getString(USERNAME_TITLE, USERNAME_DEFAULT)!!
+
+    private val SharedPreferences.password
+        get() = getString(PASSWORD_TITLE, PASSWORD_DEFAULT)!!
 
     init {
         if (baseUrl.isNotBlank()) {

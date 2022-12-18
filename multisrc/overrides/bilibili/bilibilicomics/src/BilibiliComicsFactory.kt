@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.extension.all.bilibilicomics
 
-import eu.kanade.tachiyomi.lib.ratelimit.SpecificHostRateLimitInterceptor
 import eu.kanade.tachiyomi.multisrc.bilibili.Bilibili
 import eu.kanade.tachiyomi.multisrc.bilibili.BilibiliAccessToken
 import eu.kanade.tachiyomi.multisrc.bilibili.BilibiliAccessTokenCookie
@@ -8,17 +7,21 @@ import eu.kanade.tachiyomi.multisrc.bilibili.BilibiliComicDto
 import eu.kanade.tachiyomi.multisrc.bilibili.BilibiliCredential
 import eu.kanade.tachiyomi.multisrc.bilibili.BilibiliGetCredential
 import eu.kanade.tachiyomi.multisrc.bilibili.BilibiliIntl
+import eu.kanade.tachiyomi.multisrc.bilibili.BilibiliSearchDto
 import eu.kanade.tachiyomi.multisrc.bilibili.BilibiliTag
 import eu.kanade.tachiyomi.multisrc.bilibili.BilibiliUnlockedEpisode
 import eu.kanade.tachiyomi.multisrc.bilibili.BilibiliUserEpisodes
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.SourceFactory
+import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
+import eu.kanade.tachiyomi.source.model.SManga
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
@@ -28,12 +31,15 @@ import okhttp3.Response
 import okio.Buffer
 import java.io.IOException
 import java.net.URLDecoder
+import java.util.Calendar
 
 class BilibiliComicsFactory : SourceFactory {
     override fun createSources() = listOf(
         BilibiliComicsEn(),
         BilibiliComicsCn(),
         BilibiliComicsId(),
+        BilibiliComicsEs(),
+        BilibiliComicsFr(),
     )
 }
 
@@ -44,12 +50,12 @@ abstract class BilibiliComics(lang: String) : Bilibili(
 ) {
 
     override val client: OkHttpClient = super.client.newBuilder()
-        .addInterceptor(::signedInIntercept)
-        .addInterceptor(::expiredTokenIntercept)
-        .addInterceptor(SpecificHostRateLimitInterceptor(baseUrl.toHttpUrl(), 1))
-        .addInterceptor(SpecificHostRateLimitInterceptor(CDN_URL.toHttpUrl(), 2))
-        .addInterceptor(SpecificHostRateLimitInterceptor(COVER_CDN_URL.toHttpUrl(), 2))
+        .apply { interceptors().add(0, Interceptor { chain -> signedInIntercept(chain) }) }
         .build()
+
+    init {
+        setAccessTokenCookie(baseUrl.toHttpUrl())
+    }
 
     override val signedIn: Boolean
         get() = accessTokenCookie != null
@@ -61,6 +67,44 @@ abstract class BilibiliComics(lang: String) : Bilibili(
         get() = "https://$globalApiSubDomain.bilibilicomics.com"
 
     private var accessTokenCookie: BilibiliAccessTokenCookie? = null
+
+    private val dayOfWeek: Int
+        get() = Calendar.getInstance().get(Calendar.DAY_OF_WEEK) - 1
+
+    override fun latestUpdatesRequest(page: Int): Request {
+        val jsonPayload = buildJsonObject { put("day", dayOfWeek) }
+        val requestBody = jsonPayload.toString().toRequestBody(JSON_MEDIA_TYPE)
+
+        val newHeaders = headersBuilder()
+            .add("Content-Length", requestBody.contentLength().toString())
+            .add("Content-Type", requestBody.contentType().toString())
+            .set("Referer", "$baseUrl/schedule")
+            .build()
+
+        val apiUrl = "$baseUrl/$API_COMIC_V1_COMIC_ENDPOINT/GetSchedule".toHttpUrl().newBuilder()
+            .addCommonParameters()
+            .toString()
+
+        return POST(apiUrl, newHeaders, requestBody)
+    }
+
+    override fun latestUpdatesParse(response: Response): MangasPage {
+        val result = response.parseAs<BilibiliSearchDto>()
+
+        if (result.code != 0) {
+            return MangasPage(emptyList(), hasNextPage = false)
+        }
+
+        val comicList = result.data!!.list.map(::latestMangaFromObject)
+
+        return MangasPage(comicList, hasNextPage = false)
+    }
+
+    protected open fun latestMangaFromObject(comic: BilibiliComicDto): SManga = SManga.create().apply {
+        title = comic.title
+        thumbnail_url = comic.verticalCover + THUMBNAIL_RESOLUTION
+        url = "/detail/mc${comic.comicId}"
+    }
 
     override fun chapterListParse(response: Response): List<SChapter> {
         if (!signedIn) {
@@ -95,7 +139,7 @@ abstract class BilibiliComics(lang: String) : Bilibili(
             .set("Referer", baseUrl)
             .build()
 
-        val apiUrl = "$globalApiBaseUrl/$GLOBAL_BASE_API_COMIC_ENDPOINT/GetUserEpisodes".toHttpUrl()
+        val apiUrl = "$globalApiBaseUrl/$API_COMIC_V1_USER_ENDPOINT/GetUserEpisodes".toHttpUrl()
             .newBuilder()
             .addCommonParameters()
             .toString()
@@ -134,7 +178,7 @@ abstract class BilibiliComics(lang: String) : Bilibili(
             .set("Referer", baseUrl + chapter.url)
             .build()
 
-        val apiUrl = "$globalApiBaseUrl/$GLOBAL_BASE_API_USER_ENDPOINT/GetCredential".toHttpUrl()
+        val apiUrl = "$globalApiBaseUrl/$API_GLOBAL_V1_USER_ENDPOINT/GetCredential".toHttpUrl()
             .newBuilder()
             .addCommonParameters()
             .toString()
@@ -164,15 +208,8 @@ abstract class BilibiliComics(lang: String) : Bilibili(
         return super.pageListParse(imageIndexResponse)
     }
 
-    private fun signedInIntercept(chain: Interceptor.Chain): Response {
-        var request = chain.request()
-        val requestUrl = request.url.toString()
-
-        if (!requestUrl.contains("bilibilicomics.com")) {
-            return chain.proceed(request)
-        }
-
-        val authCookie = client.cookieJar.loadForRequest(request.url)
+    private fun setAccessTokenCookie(url: HttpUrl) {
+        val authCookie = client.cookieJar.loadForRequest(url)
             .firstOrNull { cookie -> cookie.name == ACCESS_TOKEN_COOKIE_NAME }
             ?.let { cookie -> URLDecoder.decode(cookie.value, "UTF-8") }
             ?.let { jsonString -> json.decodeFromString<BilibiliAccessTokenCookie>(jsonString) }
@@ -182,6 +219,17 @@ abstract class BilibiliComics(lang: String) : Bilibili(
         } else if (authCookie == null) {
             accessTokenCookie = null
         }
+    }
+
+    private fun signedInIntercept(chain: Interceptor.Chain): Response {
+        var request = chain.request()
+        val requestUrl = request.url.toString()
+
+        if (!requestUrl.contains("bilibilicomics.com")) {
+            return chain.proceed(request)
+        }
+
+        setAccessTokenCookie(request.url)
 
         if (!accessTokenCookie?.accessToken.isNullOrEmpty()) {
             request = request.newBuilder()
@@ -202,6 +250,7 @@ abstract class BilibiliComics(lang: String) : Bilibili(
             val refreshTokenResponse = chain.proceed(refreshTokenRequest)
 
             accessTokenCookie = refreshTokenParse(refreshTokenResponse)
+            refreshTokenResponse.close()
 
             request = request.newBuilder()
                 .header("Authorization", "Bearer ${accessTokenCookie!!.accessToken}")
@@ -221,7 +270,7 @@ abstract class BilibiliComics(lang: String) : Bilibili(
             .set("Referer", baseUrl)
             .build()
 
-        val apiUrl = "$globalApiBaseUrl/$GLOBAL_BASE_API_USER_ENDPOINT/RefreshToken".toHttpUrl()
+        val apiUrl = "$globalApiBaseUrl/$API_GLOBAL_V1_USER_ENDPOINT/RefreshToken".toHttpUrl()
             .newBuilder()
             .addCommonParameters()
             .toString()
@@ -262,8 +311,8 @@ abstract class BilibiliComics(lang: String) : Bilibili(
         private const val ACCESS_TOKEN_COOKIE_NAME = "access_token"
 
         private val GLOBAL_API_SUBDOMAINS = arrayOf("us-user", "sg-user")
-        private const val GLOBAL_BASE_API_USER_ENDPOINT = "twirp/global.v1.User"
-        private const val GLOBAL_BASE_API_COMIC_ENDPOINT = "twirp/comic.v1.User"
+        private const val API_GLOBAL_V1_USER_ENDPOINT = "twirp/global.v1.User"
+        private const val API_COMIC_V1_USER_ENDPOINT = "twirp/comic.v1.User"
     }
 }
 
@@ -323,5 +372,45 @@ class BilibiliComicsId : BilibiliComics(BilibiliIntl.INDONESIAN) {
         BilibiliTag("Menegangkan", 41),
         BilibiliTag("Remaja", 20),
         BilibiliTag("Romantis", 13)
+    )
+}
+
+class BilibiliComicsEs : BilibiliComics(BilibiliIntl.SPANISH) {
+
+    override fun getAllGenres(): Array<BilibiliTag> = arrayOf(
+        BilibiliTag("Todos", -1),
+        BilibiliTag("Adolescencia", 105),
+        BilibiliTag("BL", 3),
+        BilibiliTag("Ciberdeportes", 104),
+        BilibiliTag("Ciencia ficción", 8),
+        BilibiliTag("Comedia", 14),
+        BilibiliTag("Fantasía occidental", 106),
+        BilibiliTag("Fantasía", 11),
+        BilibiliTag("Ficción Realista", 116),
+        BilibiliTag("GL", 16),
+        BilibiliTag("Histórico", 12),
+        BilibiliTag("Horror", 23),
+        BilibiliTag("Juvenil", 20),
+        BilibiliTag("Moderno", 111),
+        BilibiliTag("Oriental", 30),
+        BilibiliTag("Romance", 13),
+        BilibiliTag("Suspenso", 41),
+        BilibiliTag("Urbano", 9),
+        BilibiliTag("Wuxia", 103)
+    )
+}
+
+class BilibiliComicsFr : BilibiliComics(BilibiliIntl.FRENCH) {
+
+    override fun getAllGenres(): Array<BilibiliTag> = arrayOf(
+        BilibiliTag("Tout", -1),
+        BilibiliTag("BL", 3),
+        BilibiliTag("Science Fiction", 8),
+        BilibiliTag("Historique", 12),
+        BilibiliTag("Romance", 13),
+        BilibiliTag("GL", 16),
+        BilibiliTag("Fantasy Orientale", 30),
+        BilibiliTag("Suspense", 41),
+        BilibiliTag("Moderne", 111)
     )
 }

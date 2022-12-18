@@ -1,21 +1,27 @@
 package eu.kanade.tachiyomi.extension.ru.newbie
 
-import BookDto
-import BranchesDto
-import LibraryDto
-import MangaDetDto
-import PageDto
-import PageWrapperDto
-import SearchLibraryDto
-import SearchWrapperDto
-import SeriesWrapperDto
-import SubSearchDto
 import android.annotation.SuppressLint
 import android.annotation.TargetApi
+import android.app.Application
+import android.content.SharedPreferences
 import android.os.Build
+import android.widget.Toast
+import androidx.preference.ListPreference
+import eu.kanade.tachiyomi.extension.ru.newbie.dto.BookDto
+import eu.kanade.tachiyomi.extension.ru.newbie.dto.BranchesDto
+import eu.kanade.tachiyomi.extension.ru.newbie.dto.LibraryDto
+import eu.kanade.tachiyomi.extension.ru.newbie.dto.MangaDetDto
+import eu.kanade.tachiyomi.extension.ru.newbie.dto.PageDto
+import eu.kanade.tachiyomi.extension.ru.newbie.dto.PageWrapperDto
+import eu.kanade.tachiyomi.extension.ru.newbie.dto.SearchLibraryDto
+import eu.kanade.tachiyomi.extension.ru.newbie.dto.SearchWrapperDto
+import eu.kanade.tachiyomi.extension.ru.newbie.dto.SeriesWrapperDto
+import eu.kanade.tachiyomi.extension.ru.newbie.dto.SubSearchDto
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
+import eu.kanade.tachiyomi.network.interceptor.rateLimitHost
+import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -26,6 +32,7 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -36,13 +43,17 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.Jsoup
 import rx.Observable
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
 import java.text.DecimalFormat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.absoluteValue
+import kotlin.random.Random
 
-class Newbie : HttpSource() {
+class Newbie : ConfigurableSource, HttpSource() {
     override val name = "NewManga(Newbie)"
 
     override val id: Long = 8033757373676218584
@@ -51,12 +62,18 @@ class Newbie : HttpSource() {
 
     override val lang = "ru"
 
+    private val preferences: SharedPreferences by lazy {
+        Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
+    }
+
     override val supportsLatest = true
 
     private var branches = mutableMapOf<String, List<BranchesDto>>()
 
+    private val userAgentRandomizer = "${Random.nextInt().absoluteValue}"
+
     override fun headersBuilder(): Headers.Builder = Headers.Builder()
-        .add("User-Agent", "Tachiyomi")
+        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36 Edg/100.0.$userAgentRandomizer")
         .add("Referer", baseUrl)
 
     private fun imageContentTypeIntercept(chain: Interceptor.Chain): Response {
@@ -70,7 +87,8 @@ class Newbie : HttpSource() {
     }
 
     override val client: OkHttpClient =
-        network.client.newBuilder()
+        network.cloudflareClient.newBuilder()
+            .rateLimitHost(API_URL.toHttpUrl(), 2)
             .addInterceptor { imageContentTypeIntercept(it) }
             .build()
 
@@ -90,11 +108,9 @@ class Newbie : HttpSource() {
         val o = this
         return SManga.create().apply {
             // Do not change the title name to ensure work with a multilingual catalog!
-            title = o.title.en
+            title = if (isEng.equals("rus")) o.title.ru else o.title.en
             url = "$id"
-            thumbnail_url = if (image.srcset.large.isNotEmpty()) {
-                "$IMAGE_URL/${image.srcset.large}"
-            } else "$IMAGE_URL/${image.srcset.small}"
+            thumbnail_url = "$IMAGE_URL/${image.name}"
         }
     }
 
@@ -113,7 +129,7 @@ class Newbie : HttpSource() {
     private fun SearchLibraryDto.toSearchManga(): SManga {
         return SManga.create().apply {
             // Do not change the title name to ensure work with a multilingual catalog!
-            title = document.title_en
+            title = if (isEng.equals("rus")) document.title_ru else document.title_en
             url = document.id
             thumbnail_url = if (document.image_large.isNotEmpty()) {
                 "$IMAGE_URL/${document.image_large}"
@@ -139,6 +155,7 @@ class Newbie : HttpSource() {
         val mutableExTag = mutableListOf<String>()
         val mutableType = mutableListOf<String>()
         val mutableStatus = mutableListOf<String>()
+        val mutableTitleStatus = mutableListOf<String>()
         val mutableAge = mutableListOf<String>()
         var orderBy = "MATCH"
         var ascEnd = "DESC"
@@ -171,6 +188,11 @@ class Newbie : HttpSource() {
                         mutableStatus += '"' + status.id + '"'
                     }
                 }
+                is StatusTitleList -> filter.state.forEach { status ->
+                    if (status.state) {
+                        mutableTitleStatus += '"' + status.id + '"'
+                    }
+                }
                 is AgeList -> filter.state.forEach { age ->
                     if (age.state) {
                         mutableAge += '"' + age.id + '"'
@@ -186,7 +208,7 @@ class Newbie : HttpSource() {
 
         return POST(
             "https://neo.newmanga.org/catalogue",
-            body = """{"query":"$query","sort":{"kind":"$orderBy","dir":"$ascEnd"},"filter":{"hidden_projects":[],"genres":{"excluded":$mutableExGenre,"included":$mutableGenre},"tags":{"excluded":$mutableExTag,"included":$mutableTag},"type":{"allowed":$mutableType},"translation_status":{"allowed":[]},"released_year":{"min":null,"max":null},"require_chapters":$requireChapters,"original_status":{"allowed":$mutableStatus},"adult":{"allowed":$mutableAge}},"pagination":{"page":$page,"size":$count}}""".toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()),
+            body = """{"query":"$query","sort":{"kind":"$orderBy","dir":"$ascEnd"},"filter":{"hidden_projects":[],"genres":{"excluded":$mutableExGenre,"included":$mutableGenre},"tags":{"excluded":$mutableExTag,"included":$mutableTag},"type":{"allowed":$mutableType},"translation_status":{"allowed":$mutableStatus},"released_year":{"min":null,"max":null},"require_chapters":$requireChapters,"original_status":{"allowed":$mutableTitleStatus},"adult":{"allowed":$mutableAge}},"pagination":{"page":$page,"size":$count}}""".toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()),
             headers = headers
         )
     }
@@ -235,12 +257,13 @@ class Newbie : HttpSource() {
         val o = this
         return SManga.create().apply {
             // Do not change the title name to ensure work with a multilingual catalog!
-            title = o.title.en
+            title = if (isEng.equals("rus")) o.title.ru else o.title.en
             url = "$id"
-            thumbnail_url = "$IMAGE_URL/${image.srcset.large}"
+            thumbnail_url = "$IMAGE_URL/${image.name}"
             author = o.author?.name
             artist = o.artist?.name
-            description = o.title.ru + "\n" + ratingStar + " " + ratingValue + "\n" + Jsoup.parse(o.description).text()
+            val mediaNameLanguage = if (isEng.equals("rus")) o.title.en else o.title.ru
+            description = mediaNameLanguage + "\n" + ratingStar + " " + ratingValue + " [♡" + hearts + "]\n" + Jsoup.parse(o.description).text()
             genre = parseType(type) + ", " + adult?.let { parseAge(it) } + ", " + genres.joinToString { it.title.ru.capitalize() }
             status = parseStatus(o.status)
         }
@@ -272,6 +295,8 @@ class Newbie : HttpSource() {
     @SuppressLint("DefaultLocale")
     private fun chapterName(book: BookDto): String {
         var chapterName = "${book.tom}. Глава ${DecimalFormat("#,###.##").format(book.number).replace(",", ".")}"
+        if (!book.is_available)
+            chapterName += " \uD83D\uDCB2 "
         if (book.name?.isNotBlank() == true) {
             chapterName += " ${book.name.capitalize()}"
         }
@@ -300,27 +325,30 @@ class Newbie : HttpSource() {
                 client.newCall(chapterListRequest(branchId))
                     .asObservableSuccess()
                     .map { response ->
-                        chapterListParse(response)
+                        chapterListParse(response, manga, branchId)
                     }
             }
         }
     }
 
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val body = response.body!!.string()
-        val chapters = json.decodeFromString<SeriesWrapperDto<List<BookDto>>>(body)
+    override fun chapterListParse(response: Response) = throw UnsupportedOperationException("chapterListParse(response: Response, manga: SManga)")
 
-        return chapters.items.filter { it.is_available }.map { chapter ->
+    private fun chapterListParse(response: Response, manga: SManga, branch: Long): List<SChapter> {
+        var chapters = json.decodeFromString<SeriesWrapperDto<List<BookDto>>>(response.body!!.string()).items
+        if (!preferences.getBoolean(PAID_PREF, false)) {
+            chapters = chapters.filter { it.is_available }
+        }
+        return chapters.map { chapter ->
             SChapter.create().apply {
                 chapter_number = chapter.number
                 name = chapterName(chapter)
-                url = "/chapters/${chapter.id}/pages"
+                url = "/p/${manga.url}/$branch/r/${chapter.id}"
                 date_upload = parseDate(chapter.created_at)
                 scanlator = chapter.translator
             }
         }
     }
-    override fun chapterListRequest(manga: SManga): Request = throw NotImplementedError("Unused")
+    override fun chapterListRequest(manga: SManga): Request = throw UnsupportedOperationException("chapterListRequest(branch: Long)")
     private fun chapterListRequest(branch: Long): Request {
         return GET(
             "$API_URL/branches/$branch/chapters?reverse=true&size=1000000",
@@ -330,16 +358,15 @@ class Newbie : HttpSource() {
 
     @TargetApi(Build.VERSION_CODES.N)
     override fun pageListRequest(chapter: SChapter): Request {
-        return GET(API_URL + chapter.url, headers)
+        return GET(API_URL + "/chapters/${chapter.url.substringAfterLast("/")}/pages", headers)
     }
 
-    private fun pageListParse(response: Response, chapter: SChapter): List<Page> {
-        val body = response.body?.string()!!
-        val pages = json.decodeFromString<List<PageDto>>(body)
+    private fun pageListParse(response: Response, urlRequest: String): List<Page> {
+        val pages = json.decodeFromString<List<PageDto>>(response.body?.string()!!)
         val result = mutableListOf<Page>()
         pages.forEach { page ->
             (1..page.slices!!).map { i ->
-                result.add(Page(result.size, API_URL + chapter.url + "/${page.id}?slice=$i"))
+                result.add(Page(result.size, urlRequest + "/${page.id}?slice=$i"))
             }
         }
         return result
@@ -350,16 +377,12 @@ class Newbie : HttpSource() {
         return client.newCall(pageListRequest(chapter))
             .asObservableSuccess()
             .map { response ->
-                pageListParse(response, chapter)
+                pageListParse(response, pageListRequest(chapter).url.toString())
             }
     }
 
     override fun fetchImageUrl(page: Page): Observable<String> {
-        val bodyLength = client.newCall(GET(page.url, headers)).execute().body!!.contentLength()
-        return if (bodyLength > 320)
-            Observable.just(page.url)
-        else
-            Observable.just("$baseUrl/error-page/img/logo-fullsize.png")
+        return Observable.just(page.url)
     }
 
     override fun imageUrlRequest(page: Page): Request = throw NotImplementedError("Unused")
@@ -375,7 +398,8 @@ class Newbie : HttpSource() {
     private class SearchFilter(name: String) : Filter.TriState(name)
 
     private class TypeList(types: List<CheckFilter>) : Filter.Group<CheckFilter>("Типы", types)
-    private class StatusList(statuses: List<CheckFilter>) : Filter.Group<CheckFilter>("Статус", statuses)
+    private class StatusList(statuses: List<CheckFilter>) : Filter.Group<CheckFilter>("Статус перевода", statuses)
+    private class StatusTitleList(titles: List<CheckFilter>) : Filter.Group<CheckFilter>("Статус оригинала", titles)
     private class GenreList(genres: List<SearchFilter>) : Filter.Group<SearchFilter>("Жанры", genres)
     private class TagsList(tags: List<SearchFilter>) : Filter.Group<SearchFilter>("Теги", tags)
     private class AgeList(ages: List<CheckFilter>) : Filter.Group<CheckFilter>("Возрастное ограничение", ages)
@@ -386,6 +410,7 @@ class Newbie : HttpSource() {
         TagsList(getTagsList()),
         TypeList(getTypeList()),
         StatusList(getStatusList()),
+        StatusTitleList(getStatusTitleList()),
         AgeList(getAgeList()),
         RequireChapters()
     )
@@ -412,6 +437,12 @@ class Newbie : HttpSource() {
     )
 
     private fun getStatusList() = listOf(
+        CheckFilter("Выпускается", "ON_GOING"),
+        CheckFilter("Заброшен", "ABANDONED"),
+        CheckFilter("Завершён", "COMPLETED"),
+    )
+
+    private fun getStatusTitleList() = listOf(
         CheckFilter("Выпускается", "ON_GOING"),
         CheckFilter("Приостановлен", "SUSPENDED"),
         CheckFilter("Завершён", "COMPLETED"),
@@ -593,9 +624,46 @@ class Newbie : HttpSource() {
         CheckFilter("18+", "ADULT_18")
     )
 
+    private var isEng: String? = preferences.getString(LANGUAGE_PREF, "eng")
+    override fun setupPreferenceScreen(screen: androidx.preference.PreferenceScreen) {
+        val titleLanguagePref = ListPreference(screen.context).apply {
+            key = LANGUAGE_PREF
+            title = LANGUAGE_PREF_Title
+            entries = arrayOf("Английский", "Русский")
+            entryValues = arrayOf("eng", "rus")
+            summary = "%s"
+            setDefaultValue("eng")
+            setOnPreferenceChangeListener { _, newValue ->
+                val titleLanguage = preferences.edit().putString(LANGUAGE_PREF, newValue as String).commit()
+                val warning = "Если язык обложки не изменился очистите базу данных в приложении (Настройки -> Дополнительно -> Очистить базу данных)"
+                Toast.makeText(screen.context, warning, Toast.LENGTH_LONG).show()
+                titleLanguage
+            }
+        }
+        val paidChapterShow = androidx.preference.CheckBoxPreference(screen.context).apply {
+            key = PAID_PREF
+            title = PAID_PREF_Title
+            summary = "Показывает не купленные\uD83D\uDCB2 главы(может вызвать ошибки при обновлении/автозагрузке)"
+            setDefaultValue(false)
+
+            setOnPreferenceChangeListener { _, newValue ->
+                val checkValue = newValue as Boolean
+                preferences.edit().putBoolean(key, checkValue).commit()
+            }
+        }
+        screen.addPreference(titleLanguagePref)
+        screen.addPreference(paidChapterShow)
+    }
+
     companion object {
         private const val API_URL = "https://api.newmanga.org/v2"
         private const val IMAGE_URL = "https://storage.newmanga.org"
+
+        private const val LANGUAGE_PREF = "NewMangaTitleLanguage"
+        private const val LANGUAGE_PREF_Title = "Выбор языка на обложке"
+
+        private const val PAID_PREF = "PaidChapter"
+        private const val PAID_PREF_Title = "Показывать платные главы"
     }
 
     private val json: Json by injectLazy()

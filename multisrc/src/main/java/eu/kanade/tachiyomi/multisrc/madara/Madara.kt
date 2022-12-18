@@ -79,7 +79,7 @@ abstract class Madara(
     protected open val fetchGenres: Boolean = true
 
     override fun headersBuilder(): Headers.Builder = Headers.Builder()
-        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:77.0) Gecko/20100101 Firefox/78.0$userAgentRandomizer")
+        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0$userAgentRandomizer")
         .add("Referer", baseUrl)
 
     // Popular Manga
@@ -605,13 +605,22 @@ abstract class Madara(
     // Manga Details Parse
 
     protected val completedStatusList: Array<String> = arrayOf(
-        "Completed", "Completo", "Concluído", "Concluido", "Terminé", "Hoàn Thành", "مكتملة"
+        "Completed", "Completo", "Concluído", "Concluido", "Terminé", "Hoàn Thành", "مكتملة",
+        "مكتمل"
     )
 
     protected val ongoingStatusList: Array<String> = arrayOf(
-        "OnGoing", "Продолжается", "Updating", "Em Lançamento", "Em andamento", "Em Andamento",
-        "En cours", "Ativo", "Lançando", "Đang Tiến Hành", "Devam Ediyor", "Devam ediyor",
-        "In Corso", "In Arrivo", "مستمرة"
+        "OnGoing", "Продолжается", "Updating", "Em Lançamento", "Em lançamento", "Em andamento",
+        "Em Andamento", "En cours", "Ativo", "Lançando", "Đang Tiến Hành", "Devam Ediyor",
+        "Devam ediyor", "In Corso", "In Arrivo", "مستمرة", "مستمر", "En Curso"
+    )
+
+    protected val hiatusStatusList: Array<String> = arrayOf(
+        "On Hold"
+    )
+
+    protected val canceledStatusList: Array<String> = arrayOf(
+        "Canceled"
     )
 
     override fun mangaDetailsParse(document: Document): SManga {
@@ -644,22 +653,35 @@ abstract class Madara(
             }
             select(mangaDetailsSelectorStatus).last()?.let {
                 manga.status = when (it.text()) {
-                    // I don't know what's the corresponding for COMPLETED and LICENSED
-                    // There's no support for "Canceled" or "On Hold"
                     in completedStatusList -> SManga.COMPLETED
                     in ongoingStatusList -> SManga.ONGOING
+                    in hiatusStatusList -> SManga.ON_HIATUS
+                    in canceledStatusList -> SManga.CANCELLED
                     else -> SManga.UNKNOWN
                 }
             }
             val genres = select(mangaDetailsSelectorGenre)
-                .map { element -> element.text().toLowerCase(Locale.ROOT) }
+                .map { element -> element.text().lowercase(Locale.ROOT) }
                 .toMutableSet()
 
             // add tag(s) to genre
+            val mangaTitle = try {
+                manga.title
+            } catch (_: UninitializedPropertyAccessException) {
+                "not initialized"
+            }
+
             if (mangaDetailsSelectorTag.isNotEmpty()) {
                 select(mangaDetailsSelectorTag).forEach { element ->
-                    if (genres.contains(element.text()).not()) {
-                        genres.add(element.text().toLowerCase(Locale.ROOT))
+                    if (genres.contains(element.text()).not() &&
+                        element.text().length <= 25 &&
+                        element.text().contains("read", true).not() &&
+                        element.text().contains(name, true).not() &&
+                        element.text().contains(name.replace(" ", ""), true).not() &&
+                        element.text().contains(mangaTitle, true).not() &&
+                        element.text().contains(altName, true).not()
+                    ) {
+                        genres.add(element.text().lowercase(Locale.ROOT))
                     }
                 }
             }
@@ -667,7 +689,7 @@ abstract class Madara(
             // add manga/manhwa/manhua thinggy to genre
             document.select(seriesTypeSelector).firstOrNull()?.ownText()?.let {
                 if (it.isEmpty().not() && it.notUpdating() && it != "-" && genres.contains(it).not()) {
-                    genres.add(it.toLowerCase(Locale.ROOT))
+                    genres.add(it.lowercase(Locale.ROOT))
                 }
             }
 
