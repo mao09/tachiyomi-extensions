@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.extension.ja.mangarawru
 import eu.kanade.tachiyomi.multisrc.mangaraw.MangaRawTheme
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.FilterList
+import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SManga
 import okhttp3.Request
 import org.jsoup.nodes.Document
@@ -58,5 +59,17 @@ class MangaRawRU : MangaRawTheme("MangaRawRU", "https://mangaraw.ru") {
 
     override fun pageSelector(): Evaluator {
         return Evaluator.Tag("img")
+    }
+
+    override fun pageListParse(document: Document): List<Page> {
+
+        val position = 32
+        val parser = ImageListParser(document.html(), position)
+
+        val imageList = parser.getImageList() ?: throw Exception("Not found page.")
+
+        return imageList.withIndex().map {
+            Page(it.index, imageUrl = it.value)
+        }
     }
 }
