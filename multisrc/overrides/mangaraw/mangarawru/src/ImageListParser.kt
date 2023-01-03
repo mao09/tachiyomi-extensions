@@ -49,7 +49,6 @@ class ImageListParser(
                     charaIndexCounter++
                 }
                 2 -> {
-                    if (!imageCharList.joinToString("").contains(",")) throw Exception("Not found page.")
                     return imageCharList.joinToString("").split(",")
                 }
                 else -> {

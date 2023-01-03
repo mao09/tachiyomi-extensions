@@ -66,10 +66,8 @@ class MangaRawRU : MangaRawTheme("MangaRawRU", "https://mangaraw.ru") {
         val position = 32
         val parser = ImageListParser(document.html(), position)
 
-        val imageList = parser.getImageList() ?: throw Exception("Not found page.")
-
-        return imageList.withIndex().map {
-            Page(it.index, imageUrl = it.value)
+        return parser.getImageList().orEmpty().mapIndexed { i, imageUrl ->
+            Page(i, imageUrl = imageUrl)
         }
     }
 }
